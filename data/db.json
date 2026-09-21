@@ -21,7 +21,11 @@
       "repairNote": "",
       "batchId": null,
       "createdAt": "2026-06-16T00:00:00.000Z",
-      "repairedAt": null
+      "repairedAt": null,
+      "riskCategory": null,
+      "quarantinedAt": null,
+      "releasedAt": null,
+      "lastTreatmentId": null
     },
     {
       "id": "damage_demo_2",
@@ -34,8 +38,13 @@
       "repairNote": "",
       "batchId": null,
       "createdAt": "2026-06-16T00:00:00.000Z",
-      "repairedAt": null
+      "repairedAt": null,
+      "riskCategory": null,
+      "quarantinedAt": null,
+      "releasedAt": null,
+      "lastTreatmentId": null
     }
   ],
-  "batches": []
+  "batches": [],
+  "treatments": []
 }
