@@ -18,9 +18,12 @@
       "beforePhotoUrl": "https://example.local/before-014-1.jpg",
       "afterPhotoUrl": "",
       "status": "pending",
+      "riskCategory": null,
       "repairNote": "",
       "batchId": null,
       "createdAt": "2026-06-16T00:00:00.000Z",
+      "quarantinedAt": null,
+      "releasedAt": null,
       "repairedAt": null
     },
     {
@@ -31,11 +34,15 @@
       "beforePhotoUrl": "https://example.local/before-014-2.jpg",
       "afterPhotoUrl": "",
       "status": "pending",
+      "riskCategory": null,
       "repairNote": "",
       "batchId": null,
       "createdAt": "2026-06-16T00:00:00.000Z",
+      "quarantinedAt": null,
+      "releasedAt": null,
       "repairedAt": null
     }
   ],
-  "batches": []
+  "batches": [],
+  "treatments": []
 }

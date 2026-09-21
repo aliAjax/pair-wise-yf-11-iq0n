@@ -2,6 +2,10 @@ const http = require("http");
 const { readFile, writeFile, mkdir } = require("fs/promises");
 const path = require("path");
 
+const quarantine = require("./lib/quarantine");
+const treatment = require("./lib/treatment");
+const { assertBatchAdmission } = require("./lib/batchGate");
+
 const PORT = Number(process.env.PORT || 3020);
 const DB_FILE = path.join(__dirname, "data", "db.json");
 
@@ -25,9 +29,12 @@ const initialData = {
       beforePhotoUrl: "https://example.local/before-014-1.jpg",
       afterPhotoUrl: "",
       status: "pending",
+      riskCategory: null,
       repairNote: "",
       batchId: null,
       createdAt: new Date().toISOString(),
+      quarantinedAt: null,
+      releasedAt: null,
       repairedAt: null
     },
     {
@@ -38,13 +45,17 @@ const initialData = {
       beforePhotoUrl: "https://example.local/before-014-2.jpg",
       afterPhotoUrl: "",
       status: "pending",
+      riskCategory: null,
       repairNote: "",
       batchId: null,
       createdAt: new Date().toISOString(),
+      quarantinedAt: null,
+      releasedAt: null,
       repairedAt: null
     }
   ],
-  batches: []
+  batches: [],
+  treatments: []
 };
 
 const routes = [
@@ -55,6 +66,9 @@ const routes = [
   "POST /rubbings/:id/damages",
   "GET /damages?status=&type=",
   "PATCH /damages/:id",
+  "GET /damages/:id/treatments",
+  "POST /damages/:id/treatments",
+  "POST /damages/:id/release",
   "GET /batches",
   "POST /batches",
   "GET /batches/:id",
@@ -72,7 +86,15 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  if (!Array.isArray(db.treatments)) db.treatments = [];
+  // 旧缺损缺少风险字段时按安全处理，归一化后落盘保留
+  let changed = false;
+  (db.damages || []).forEach((damage) => {
+    if (quarantine.normalizeDamage(damage)) changed = true;
+  });
+  if (changed) await writeDb(db);
+  return db;
 }
 
 async function writeDb(data) {
@@ -84,6 +106,12 @@ function send(res, status, body) {
   res.end(JSON.stringify(body, null, 2));
 }
 
+function fail(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
 async function parseBody(req) {
   let raw = "";
   for await (const chunk of req) raw += chunk;
@@ -91,9 +119,7 @@ async function parseBody(req) {
   try {
     return JSON.parse(raw);
   } catch {
-    const error = new Error("请求体必须是合法JSON");
-    error.status = 400;
-    throw error;
+    throw fail(400, "请求体必须是合法JSON");
   }
 }
 
@@ -103,20 +129,12 @@ function makeId(prefix) {
 
 function required(body, fields) {
   const missing = fields.filter((field) => body[field] === undefined || body[field] === "");
-  if (missing.length) {
-    const error = new Error(`缺少字段：${missing.join(", ")}`);
-    error.status = 400;
-    throw error;
-  }
+  if (missing.length) throw fail(400, `缺少字段：${missing.join(", ")}`);
 }
 
 function findRubbing(db, rubbingId) {
   const rubbing = db.rubbings.find((item) => item.id === rubbingId);
-  if (!rubbing) {
-    const error = new Error("拓片不存在");
-    error.status = 404;
-    throw error;
-  }
+  if (!rubbing) throw fail(404, "拓片不存在");
   return rubbing;
 }
 
@@ -135,6 +153,7 @@ async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
   const db = await readDb();
+  const now = new Date().toISOString();
 
   if (req.method === "GET" && pathname === "/health") {
     return send(res, 200, { ok: true, service: "rubbing-repair-api", routes });
@@ -146,7 +165,8 @@ async function handle(req, res) {
       return {
         ...rubbing,
         damageCount: damages.length,
-        pendingDamages: damages.filter((item) => item.status !== "repaired").length
+        pendingDamages: damages.filter((item) => item.status !== "repaired").length,
+        quarantinedDamages: damages.filter((item) => item.status === "quarantined").length
       };
     });
     return send(res, 200, { data });
@@ -161,7 +181,7 @@ async function handle(req, res) {
       source: body.source,
       paperSize: body.paperSize,
       note: body.note || "",
-      createdAt: new Date().toISOString()
+      createdAt: now
     };
     db.rubbings.push(rubbing);
     await writeDb(db);
@@ -180,6 +200,8 @@ async function handle(req, res) {
     findRubbing(db, rubbingId);
     const body = await parseBody(req);
     required(body, ["position", "type", "beforePhotoUrl"]);
+    const riskCategory = quarantine.detectRiskCategory(body);
+    const quarantined = Boolean(riskCategory);
     const damage = {
       id: makeId("damage"),
       rubbingId,
@@ -187,10 +209,14 @@ async function handle(req, res) {
       type: body.type,
       beforePhotoUrl: body.beforePhotoUrl,
       afterPhotoUrl: "",
-      status: "pending",
+      // 标记虫蛀、霉斑、污染后直接进入隔离
+      status: quarantined ? "quarantined" : "pending",
+      riskCategory,
       repairNote: "",
       batchId: null,
-      createdAt: new Date().toISOString(),
+      createdAt: now,
+      quarantinedAt: quarantined ? now : null,
+      releasedAt: null,
       repairedAt: null
     };
     db.damages.push(damage);
@@ -205,11 +231,43 @@ async function handle(req, res) {
     return send(res, 200, { data });
   }
 
+  const damageTreatmentsMatch = pathname.match(/^\/damages\/([^/]+)\/treatments$/);
+  if (damageTreatmentsMatch && req.method === "GET") {
+    const data = treatment.listTreatments(db, damageTreatmentsMatch[1]);
+    return send(res, 200, { data });
+  }
+
+  if (damageTreatmentsMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    const record = treatment.addTreatment(db, damageTreatmentsMatch[1], body, makeId, now);
+    await writeDb(db);
+    return send(res, 201, { data: record });
+  }
+
+  const releaseMatch = pathname.match(/^\/damages\/([^/]+)\/release$/);
+  if (releaseMatch && req.method === "POST") {
+    const { damage, treatment: cert } = treatment.release(db, releaseMatch[1], now);
+    await writeDb(db);
+    return send(res, 200, { data: damage, releasedBy: cert });
+  }
+
   const damagePatchMatch = pathname.match(/^\/damages\/([^/]+)$/);
   if (damagePatchMatch && req.method === "PATCH") {
     const damage = db.damages.find((item) => item.id === damagePatchMatch[1]);
     if (!damage) return send(res, 404, { error: "缺损项不存在" });
     const body = await parseBody(req);
+    const originalType = damage.type;
+
+    // 隔离闭环：隔离中的缺损只能走除害放行，禁止直接改状态或清除风险标记
+    if (quarantine.isQuarantined(damage)) {
+      if (body.status !== undefined && body.status !== "quarantined") {
+        throw fail(409, "缺损处于隔离状态，须完成除害并放行后才能变更状态");
+      }
+      if (body.riskCategory !== undefined && body.riskCategory !== damage.riskCategory) {
+        throw fail(409, "缺损处于隔离状态，不可变更风险标记");
+      }
+    }
+
     Object.assign(damage, {
       position: body.position ?? damage.position,
       type: body.type ?? damage.type,
@@ -218,7 +276,16 @@ async function handle(req, res) {
       status: body.status ?? damage.status,
       repairNote: body.repairNote ?? damage.repairNote
     });
-    damage.repairedAt = damage.status === "repaired" ? new Date().toISOString() : damage.repairedAt;
+
+    // 补标记虫蛀、霉斑、污染：进入隔离
+    // type 原样回传不算新标记，避免编辑旧缺损时被关键字误隔离；显式 riskCategory 始终生效
+    const riskInput = body.type !== undefined && body.type === originalType ? { ...body, type: undefined } : body;
+    const riskCategory = quarantine.detectRiskCategory(riskInput);
+    if (riskCategory && !quarantine.isQuarantined(damage)) {
+      quarantine.markQuarantined(damage, riskCategory, now);
+    }
+
+    damage.repairedAt = damage.status === "repaired" ? damage.repairedAt || now : damage.repairedAt;
     await writeDb(db);
     return send(res, 200, { data: damage });
   }
@@ -230,16 +297,26 @@ async function handle(req, res) {
   if (req.method === "POST" && pathname === "/batches") {
     const body = await parseBody(req);
     required(body, ["name", "damageIds"]);
-    if (!Array.isArray(body.damageIds) || body.damageIds.length === 0) return send(res, 400, { error: "damageIds必须是非空数组" });
+    if (!Array.isArray(body.damageIds) || body.damageIds.length === 0) {
+      return send(res, 400, { error: "damageIds必须是非空数组" });
+    }
     const invalid = body.damageIds.filter((id) => !db.damages.find((damage) => damage.id === id));
     if (invalid.length) return send(res, 400, { error: `缺损项不存在：${invalid.join(", ")}` });
+
+    // 批次准入：隔离中、风险无有效除害凭证、非待修一律拒绝
+    try {
+      assertBatchAdmission(db, body.damageIds, Date.parse(now));
+    } catch (error) {
+      return send(res, error.status || 409, { error: error.message });
+    }
+
     const batch = {
       id: makeId("batch"),
       name: body.name,
       status: "open",
       damageIds: body.damageIds,
       note: body.note || "",
-      createdAt: new Date().toISOString(),
+      createdAt: now,
       completedAt: null
     };
     db.batches.push(batch);
@@ -267,7 +344,7 @@ async function handle(req, res) {
     const body = await parseBody(req);
     const results = Array.isArray(body.results) ? body.results : [];
     batch.status = "completed";
-    batch.completedAt = new Date().toISOString();
+    batch.completedAt = now;
     batch.note = body.note ?? batch.note;
     db.damages.forEach((damage) => {
       if (!batch.damageIds.includes(damage.id)) return;
@@ -275,7 +352,7 @@ async function handle(req, res) {
       damage.status = "repaired";
       damage.afterPhotoUrl = result.afterPhotoUrl || body.defaultAfterPhotoUrl || damage.afterPhotoUrl;
       damage.repairNote = result.repairNote || body.defaultRepairNote || damage.repairNote;
-      damage.repairedAt = new Date().toISOString();
+      damage.repairedAt = now;
     });
     await writeDb(db);
     return send(res, 200, { data: enrichBatch(db, batch) });
